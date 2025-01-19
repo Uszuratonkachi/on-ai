@@ -14,12 +14,19 @@ import json
 from os import getenv
 
 # Настройка Redis
-redis_client = redis.StrictRedis(
-    host=getenv("REDIS_HOST", "localhost"),
-    port=int(getenv("REDIS_PORT", 6379)),
-    db=int(getenv("REDIS_DB", 0)),
-    decode_responses=True
-)
+try:
+    redis_client = redis.StrictRedis(
+        host=getenv("REDIS_HOST", "localhost"),
+        port=int(getenv("REDIS_PORT", 6379)),
+        db=int(getenv("REDIS_DB", 0)),
+        decode_responses=True
+    )
+    # Проверяем подключение
+    redis_client.ping()
+    logging.info("Redis connection successful!")
+except Exception as e:
+    logging.error(f"Failed to connect to Redis: {e}")
+    redis_client = None
 
 # Настройка лимитера
 limiter = Limiter(key_func=get_remote_address)
@@ -35,16 +42,22 @@ router = APIRouter()
 
 @router.post("/webhook", response_model=LLMResponse)
 @limiter.limit("5/minute")  # Ограничение: 5 запросов в минуту на IP
-async def handle_webhook(request: WebhookRequest, background_tasks: BackgroundTasks):
+async def handle_webhook(request: Request, webhook_request: WebhookRequest, background_tasks: BackgroundTasks):
+    """Обработка входящих webhook-запросов."""
     try:
-        logger.info(f"Received request: {request.dict()}")
+        logger.info(f"Received request: {webhook_request.dict()}")
 
-        if not request.callback_url:
+        if not webhook_request.callback_url:
             logger.error("callback_url is required but not provided.")
             raise HTTPException(status_code=400, detail="callback_url is required")
 
         # Генерируем ключ для хранения контекста
-        context_key = f"context:{request.callback_url}"
+        context_key = f"context:{webhook_request.callback_url}"
+
+        # Проверяем доступность Redis
+        if not redis_client:
+            logger.error("Redis is not available.")
+            raise HTTPException(status_code=500, detail="Redis is not available")
 
         # Инициализация контекста
         if not redis_client.exists(context_key):
@@ -59,14 +72,15 @@ async def handle_webhook(request: WebhookRequest, background_tasks: BackgroundTa
 
         # Проверка лимита запросов
         context = redis_client.hgetall(context_key)
-        if int(context["request_count"]) > MAX_REQUESTS:
-            logger.error(f"Rate limit exceeded for {request.callback_url}")
+        request_count = int(context.get("request_count", 0))
+        if request_count > MAX_REQUESTS:
+            logger.error(f"Rate limit exceeded for {webhook_request.callback_url}")
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
         # Добавление сообщения в контекст
-        messages = json.loads(context["messages"])
-        if request.message not in messages:
-            messages.append(request.message)
+        messages = json.loads(context.get("messages", "[]"))
+        if webhook_request.message not in messages:
+            messages.append(webhook_request.message)
             redis_client.hset(context_key, "messages", json.dumps(messages))
             redis_client.hset(context_key, "last_updated", datetime.utcnow().isoformat())
 
@@ -74,7 +88,7 @@ async def handle_webhook(request: WebhookRequest, background_tasks: BackgroundTa
 
         # Вызов LLM API
         try:
-            generated_response = await call_llm(request.message)
+            generated_response = await call_llm(webhook_request.message)
         except Exception as e:
             logger.error(f"Error during LLM API call: {e}")
             raise HTTPException(status_code=502, detail="Failed to process message with LLM")
@@ -86,8 +100,8 @@ async def handle_webhook(request: WebhookRequest, background_tasks: BackgroundTa
 
         # Формирование ответа
         response_data = {"response": generated_response}
-        logger.info(f"Sending response to callback URL: {request.callback_url}")
-        background_tasks.add_task(send_to_callback, str(request.callback_url), response_data)
+        logger.info(f"Sending response to callback URL: {webhook_request.callback_url}")
+        background_tasks.add_task(send_to_callback, str(webhook_request.callback_url), response_data)
 
         return response_data
 
@@ -105,6 +119,10 @@ async def handle_webhook(request: WebhookRequest, background_tasks: BackgroundTa
 
 def cleanup_context(context_key: str):
     """Очистка старых данных из контекста в Redis."""
+    if not redis_client:
+        logger.error("Redis is not available for cleanup.")
+        return
+
     context = redis_client.hgetall(context_key)
     if context and "last_updated" in context:
         last_updated = datetime.fromisoformat(context["last_updated"])
